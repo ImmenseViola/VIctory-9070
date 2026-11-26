@@ -128,13 +128,19 @@ the wrong lengths visible and explains the bad early outdoor build. Texture
 dimensions and descriptors made from root arguments keep their original
 lowering. `TRANSLATOR_VERSION` moved to 3 to invalidate the wrong-offset cache.
 
-`VICTORY_SKIP_WARM_BAD=1` now refuses pipelines the warm worker found fault on,
-pipelines containing those shaders, and the `CS_RaytracingResolve_*` family, so
-a late pipeline cannot fault inside the title. It stays off on RDNA3, where the
-tuned build compiles them. XCL-style first-lane lowering, wave32 metadata,
-integer raw loads and skipped typed stores were tried but did not remove the
-fault; they remain default-off experiments. The global XCL wave64 split was not
-ported, because it can be 1.3x to 5x slower.
+`VICTORY_SKIP_WARM_BAD=1` can refuse exact pipelines and shader hashes that a
+fresh warm run found fault on. Bad lists are read only when they carry the
+current driver/translator fingerprint: a stale list from before the host-size
+fix refused the fixed skinning shader and around 300 compute draws a frame in a
+busy-street gunfight, taking that scene to about 5 FPS. The broad
+`CS_RaytracingResolve_*` family rule was removed for the same reason. The guard
+stays off by default. XCL-style first-lane lowering, wave32 metadata, integer
+raw loads and skipped typed stores were tried but did not remove the fault;
+they remain default-off experiments. The global XCL wave64 split was not
+ported, because it can be 1.3x to 5x slower. A fresh warm with the final binary
+made 2,138 pipelines with 0 bad, and the following guard-off run had 3,951
+shader-cache hits with 0 misses, no refused compute, and 17.61 FPS mean / 18.7
+FPS median in the boat scene.
 
 The final 480-second validation on this card measured 18.27 FPS mean and
 19.6 FPS median over 149 world samples. The first two minutes were the stutter

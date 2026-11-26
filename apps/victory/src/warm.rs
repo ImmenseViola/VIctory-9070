@@ -9,7 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use victory_hle::known_pipelines as known;
 
 /// Pipelines a process makes before another takes its place: the compiler's
@@ -28,6 +28,15 @@ fn folder() -> Result<PathBuf> {
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
+    for name in ["known-shaders.bin", "known-pipelines.bin"] {
+        let path = dir.join(name);
+        if !std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            bail!(
+                "{} is missing or empty; run one game session with VICTORY_PIPELINE_BOOK=1 before warming",
+                path.display()
+            );
+        }
+    }
     if let Some(these) = these {
         return make(&dir, &these);
     }
@@ -47,7 +56,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         }
     }
     let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let bad: HashSet<&str> = bad
+        .lines()
+        .filter_map(|l| {
+            let (of, key) = l.split_once(' ')?;
+            (of == fingerprint).then_some(key)
+        })
+        .collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -93,11 +108,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
             lock(&state).2 += 1;
         },
     )?;
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
+    if !all.is_empty() && times.is_empty() {
+        bail!("no pipelines were made; check that the shader and pipeline books came from this title and driver");
+    }
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
@@ -189,6 +207,7 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
     let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
     let hung = AtomicBool::new(false);
     let mut made = 0;
+    let mut started = 0;
     std::thread::scope(|s| {
         s.spawn(|| {
             while !over.load(Ordering::Relaxed) {
@@ -203,12 +222,17 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             *lock(&heard) = Instant::now();
             let mut words = line.split(' ');
-            if words.next() == Some("made")
-                && let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
-                && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
-            {
-                made += 1;
-                each(n, ms, there == "1");
+            match words.next() {
+                Some("at") => started += 1,
+                Some("made") => {
+                    if let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
+                        && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
+                    {
+                        made += 1;
+                        each(n, ms, there == "1");
+                    }
+                }
+                _ => {}
             }
         }
         over.store(true, Ordering::Relaxed);
@@ -223,6 +247,9 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
     } else {
         status.map_or_else(|e| e.to_string(), |s| format!("{s}"))
     };
+    if made == 0 && started == 0 {
+        bail!("warm worker failed before starting a pipeline: {why}");
+    }
     Ok(Some((made, why)))
 }
 

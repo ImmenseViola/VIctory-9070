@@ -121,13 +121,67 @@ matching the boat/late-scene report. GPU memory stayed around 11.7 GB of a
 14.2 GB budget.
 
 No `ERROR` lines, panic, device removal, or `0xc0000005` appeared in the final
-log. One warm-bad pipeline was refused at startup, as configured. The launcher
-was killed by the shell's 900-second timeout after its 470-second screenshot;
-the game itself had not exited or crashed. This supports the low-early-FPS
-hypothesis: it was mostly making pipelines and streaming assets, not a
-permanent frame-rate regression. A dedicated frame log with pipeline-creation
-and host-memory counters is still the next step if the first two minutes need
-to be improved.
+log. The guard refused one pipeline from a bad list that had been written
+before the host-size fix. The launcher was killed by the shell's 900-second
+timeout after its 470-second screenshot; the game itself had not exited or
+crashed. This supports the low-early-FPS hypothesis: it was mostly making
+pipelines and streaming assets, not a permanent frame-rate regression. A
+dedicated frame log with pipeline-creation and host-memory counters is still
+the next step if the first two minutes need to be improved.
+
+### What the later playthrough found
+
+The user completed a mission in the boat scene at 16-22 FPS, then played into a
+busy-street gunfight. There the frame rate fell to about 5 FPS even though no
+pipelines were being made. The log explains it: `VICTORY_SKIP_WARM_BAD=1` was
+reading a 31-shader bad list written against the old, wrong-offset
+translations. It refused around 300 compute draws a frame, including the fixed
+skinning shader `f16876929fa64f9f` and the broad `CS_RaytracingResolve_*`
+family. The map and menus stayed at a solid 30 FPS, so this was not a global
+GPU limit.
+
+The bad lists are now read only when their first word is the current
+driver/translator fingerprint, and the family-wide rule is gone. The
+recommended switches no longer turn the guard on.
+
+### Clean guard-off validation
+
+The final binary was rebuilt and used for a fresh warm: 2,138 pipelines made, 0
+bad, and 0 with no host pipeline. The following game session reported 3,951
+shader-cache hits with 0 misses, so both books are now valid for translator 3.
+In the boat scene, 30 world samples over about 2.5 minutes gave 17.61 FPS mean
+and 18.7 FPS median, with no `refused [compute]` lines, no errors, and no
+faults. The remaining “without a host pipeline” drops were all “a stage of the
+ray-tracing structure builder, which is off”, not shader refusals. A 6,369-draw
+frame held 11.3 FPS with 41.8 ms preparing and 23.4 ms on the GPU; the
+stale-guard run had similar draw counts near 5 FPS. As a direct check,
+`f16876929fa64f9f`, `1512b6b81c4072ed` and `29be03ccaa4e353a` were each
+translated, given a host pipeline, and first-bound in the clean session.
+
+The same playthrough reported: face textures and beards followed dialogue but
+the model's lips did not move; eyes and sunglasses looked blueish; picture was
+blurry in Series S mode; one vegetation piece was neon green; trees and grass
+shimmered; and a dark shed showed artifacts around the character and dust.
+Some of these may be the refused compute work; the rest are open visual bugs.
+
+The refused work includes plausible causes for several of them:
+`f16876929fa64f9f` / `878933b499cfa14d` skin the animation tree,
+`1512b6b81c4072ed` is `ped_standard_eye`, and several
+`CS_RaytracingResolve_*` containers cover retroreflection on eyes, sunglasses
+and props. The guard also refused `29be03ccaa4e353a`
+(`billboard_nobump:CS_RaytracingResolve_dcbebc34_Wrapped`) at startup. That
+makes the lip and reflection symptoms likely consequences of missing compute.
+The clean no-guard run binds those shaders normally; whether the artifacts are
+gone is still awaiting the player's visual comparison. The dark-shed/dust
+artifacts were not tied to a refused ambient shader, so they remain a separate
+lead.
+
+If the visual artifacts remain, the next experiments are, one at a time:
+`VICTORY_WALLS_TRACE=1` for tree/grass/slod cadence, `VICTORY_HELPER_OWN=0`
+for edge/quad artifacts, `VICTORY_AMBIENT=1` for the dark shed, and an
+upscaler 6 versus 7 comparison for softness. Do not change `VICTORY_FFX_SCALE`.
+If blue reflections survive the clean run, compare the `CS_RaytracingResolve`
+and cube-gradient translations with `VICTORY_SHADER_SAVE` / `VICTORY_EMIT_DUMP`.
 
 Tree/foliage flicker and occasional black glass are still present and are not
 fixed by this work. After the release run the user played the boat mission
@@ -137,11 +191,10 @@ successfully at 16-22 FPS and reported that trees and grass still shimmer.
 
 - `CS_PedStandardSkinning_12_15f19d85_Wrapped` is restored. Earlier crash
   guards had skipped it and removed NPC skinning.
-- The warm-bad guard now refuses any pipeline named in `warm-bad.txt`, any
-  pipeline containing a shader from `warm-bad-shaders.txt`, and the whole
-  `CS_RaytracingResolve_*` compute family when
-  `VICTORY_SKIP_WARM_BAD=1`. It is off by default: the 7900 XTX build compiles
-  those programs.
+- The warm-bad guard can refuse exact pipelines and exact shader hashes when
+  `VICTORY_SKIP_WARM_BAD=1`. Entries must carry the current driver/translator
+  fingerprint; stale lists and the broad family rule are ignored. It is off by
+  default: the 7900 XTX build compiles those programs.
 - Shader registration no longer holds the global lock while a container is
   parsed and copied. Two threads may build the same container; only the one
   inserted is counted.
@@ -161,7 +214,7 @@ Start from the tuned 7900 XTX settings and add these:
 scripts\play.ps1 -Exe <your game.exe> -More @{
     VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_DESCRIPTORS = '1'
     VICTORY_PORT_CBV = '1'; VICTORY_PORT_GUARD = '1'
-    VICTORY_SKIP_WARM_BAD = '1'; VICTORY_PANEL = '1'
+    VICTORY_PANEL = '1'
     VICTORY_UPSCALER = '6'; VICTORY_OUTPUT = '1920x1080'
     VICTORY_RESIDENCY = '1'; VICTORY_ASYNC_SUBMIT = '1'
     VICTORY_LATE_WAIT = '1'

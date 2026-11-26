@@ -38,6 +38,7 @@ FSR upscaler 6, ray tracing off.
 | NPC skinning | restored: ped flickering gone, NPCs render correctly |
 | Indoor scene in play test | about 21 FPS |
 | Boat scene in play test | 16-22 FPS in the user's mission run; the mission was completed successfully |
+| Boat scene, clean guard-off rerun | 30 world samples, 17.61 FPS mean, 18.7 FPS median; no refused compute, no error or fault |
 | Outdoor early game in the *experimental* build | 1-6 FPS with large stutters; likely wrong host-size offset, shader recompilation and/or asset streaming, not yet separated |
 | Final release validation | 480-second run, fresh version-3 cache, overlay on: 18.27 FPS mean, 19.6 FPS median; no game or driver fault |
 | Panel | top-left FPS, frame ms, longest frame, GPU busy, RAM, VRAM, system CPU and VIctory CPU |
@@ -49,9 +50,22 @@ frame was spent waiting for them. From minute 3 to minute 11 it held about
 18-21 FPS (median 21.2 in several minutes); the last two minutes were about
 15 FPS, matching the boat/late-scene report. GPU memory stayed around 11.7 GB
 of a 14.2 GB budget. There were no `ERROR` lines, no device removal, and no
-`0xc0000005`; one warm-bad pipeline was refused at startup, as intended. The
-launcher was stopped by the shell's 900-second timeout after its 470-second
+`0xc0000005`; the guard refused one pipeline from a bad list written before the
+host-size fix. Later play showed that list was stale: it also named the fixed
+skinning shader and refused hundreds of compute draws in busy scenes. The guard
+now ignores lists that do not carry the current driver/translator fingerprint.
+The launcher was stopped by the shell's 900-second timeout after its 470-second
 screenshot; the game itself was still running normally.
+
+The guard fix was then checked in a fresh game session after a clean warm:
+2,138 pipelines made, 0 bad, and 3,951 shader-cache hits with 0 misses. The
+boat scene held 17.61 FPS mean and 18.7 FPS median across 30 samples. There
+were no `refused [compute]` drops, errors, or faults; the remaining
+“without a host pipeline” drops were the intentionally disabled ray-tracing
+structure builder. A 6,369-draw frame held 11.3 FPS where the stale-guard run
+had similar scenes at about 5 FPS. The skinning shader `f16876929fa64f9f`,
+eye shader `1512b6b81c4072ed`, and reflection shader `29be03ccaa4e353a` were
+all translated, given host pipelines, and bound normally.
 
 The earlier 300-second guard build also completed without a crash at 18.16 FPS
 mean and 21.0 FPS median, but it still had skinning disabled, so it is only a
@@ -92,11 +106,12 @@ investigation, including the rejected approaches, is in
   arguments and all texture dimensions are unchanged.
 - **Translator version 3** invalidates the experimental wrong-offset cache.
   Regenerate shaders and pipelines after updating.
-- **Bad RDNA4 pipelines are refused when asked.** With
-  `VICTORY_SKIP_WARM_BAD=1`, runs refuse the pipelines in `warm-bad.txt`,
-  pipelines containing a shader in `warm-bad-shaders.txt`, and the whole
-  `CS_RaytracingResolve_*` compute family. Nothing is skipped by default: the
-  7900 XTX build compiles them.
+- **Bad RDNA4 pipelines can be refused when asked.** With
+  `VICTORY_SKIP_WARM_BAD=1`, runs refuse only the exact pipelines and shader
+  hashes in `warm-bad.txt` / `warm-bad-shaders.txt` whose first word is the
+  current driver/translator fingerprint. Older lists, and the broad
+  `CS_RaytracingResolve_*` family rule, are ignored: they refused real gameplay
+  compute work after the host-size fix. Nothing is skipped by default.
 - **The shader registration lock is released before parsing a container.**
   This removes a hot lock around two scans and a copy; two threads can build
   the same container, and only the one inserted is counted.
@@ -109,9 +124,20 @@ already has a persistent `wide*` worker pool.
 
 ## Known problems
 
-- Trees and grass still shimmer/flicker, including in the boat scene. The
-  skinning fix did not touch vegetation.
-- Glass sometimes renders black.
+- Trees and grass still shimmer/flicker, including in the boat scene. One piece
+  of vegetation rendered neon green in the playthrough. The skinning fix did
+  not touch vegetation.
+- Glass sometimes renders black. Sunglasses and eyes can look blueish, as if a
+  reflection pass were wrong.
+- In dialogue, face textures and beards moved but the model's lips did not in
+  the stale-guard playthrough. The clean rerun binds the skinning shader
+  normally; visual confirmation is still needed.
+- Dark interiors can show artifacts around the character and dust in the air.
+- The picture can look soft in Series S mode at 1080p with upscaler 6. Series X
+  or a higher output sharpens it at a frame-rate cost.
+- A busy-street gunfight fell to about 5 FPS while the stale warm-bad list
+  refused hundreds of compute draws. The list is now ignored and a clean rerun
+  held 11.3 FPS at 6,369 draws with zero refused compute work.
 - Lighting can be too bright or too dark after walking indoors until the
   title has settled; rooms with little direct light are too dark without
   `-RayTracing`.
@@ -150,7 +176,7 @@ For an RX 9070, start from the tuned ports and add the RDNA4 switches:
 scripts\play.ps1 -Exe <your game.exe> -More @{
     VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_DESCRIPTORS = '1'
     VICTORY_PORT_CBV = '1'; VICTORY_PORT_GUARD = '1'
-    VICTORY_SKIP_WARM_BAD = '1'; VICTORY_PANEL = '1'
+    VICTORY_PANEL = '1'
     VICTORY_UPSCALER = '6'; VICTORY_OUTPUT = '1920x1080'
     VICTORY_RESIDENCY = '1'; VICTORY_ASYNC_SUBMIT = '1'
     VICTORY_LATE_WAIT = '1'
@@ -189,7 +215,7 @@ The tuned renderer patches are off by default as upstream exposes them:
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are byte-checked to report the slots they write, instead of scanning ~600,000 slots a frame |
 | `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes |
 | `VICTORY_PORT_GUARD=1` | Write guards share a lock with refreshes and a claim per 64 KiB block; submission planning runs beside it |
-| `VICTORY_SKIP_WARM_BAD=1` | RDNA4 only: refuse pipelines known to fault this driver |
+| `VICTORY_SKIP_WARM_BAD=1` | Optional: refuse exact pipelines/shaders from a fresh bad list for this driver and translator; leave off otherwise |
 | `VICTORY_PANEL=1` | Draw the top-left FPS/frame-time/GPU/CPU overlay |
 | `--console series-s` | Series S profile: 1080p output, about 5 ms faster, a softer picture |
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself |

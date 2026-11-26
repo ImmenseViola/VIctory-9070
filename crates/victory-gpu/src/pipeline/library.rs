@@ -51,12 +51,12 @@
 //! `warm-bad.txt`. Running games do not read that file, so they compile it
 //! again inside the title and the driver faults there. `VICTORY_SKIP_WARM_BAD=1`
 //! makes runs refuse those pipelines instead: the title goes without them.
-//! `warm-bad-shaders.txt` names the shaders behind those pipelines too, so a
-//! late pipeline with one of the same shaders is refused before the driver
-//! sees it; the whole `CS_RaytracingResolve_*` compute family is refused as
-//! well, for variants the warm list has not seen. This is meant for a card
-//! whose driver cannot compile them (a RDNA4 card with the title's FSR4
-//! passes, for example); nothing is skipped by default.
+//! `warm-bad-shaders.txt` can name the exact shaders behind a fault too. Both
+//! files are read only when their first word is the current driver and
+//! translator fingerprint, so a list written against an older translation is
+//! ignored. Only exact keys and exact shader hashes are refused: a family-wide
+//! rule was tried and refused hundreds of real gameplay compute draws on
+//! RDNA4. Nothing is skipped by default.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -91,11 +91,15 @@ fn bad_keys() -> &'static HashSet<String> {
     static BAD: OnceLock<HashSet<String>> = OnceLock::new();
     BAD.get_or_init(|| {
         let mut bad = HashSet::new();
+        let fingerprint = super::known::fingerprint();
         if let Some(dir) = folder()
             && let Ok(text) = std::fs::read_to_string(dir.join("warm-bad.txt"))
         {
             for line in text.lines() {
-                if let Some(key) = line.split_whitespace().next() {
+                let mut words = line.split_whitespace();
+                if words.next() == Some(fingerprint.as_str())
+                    && let Some(key) = words.next()
+                {
                     bad.insert(key.to_owned());
                 }
             }
@@ -116,18 +120,22 @@ pub(crate) fn is_bad(name: &str) -> bool {
 }
 
 /// The shader hashes named in `warm-bad-shaders.txt`, shortened to the first
-/// eight bytes as [`crate::pipeline::Shader::hash`] reports them. A pipeline
-/// the warm list never saw can still fault on one of these shaders late in a
-/// run; checking the shader keeps that from happening in the title's process.
+/// eight bytes as [`crate::pipeline::Shader::hash`] reports them. Lines must
+/// start with the current fingerprint: a list written against an older
+/// translation would refuse shaders that now compile.
 fn bad_shader_hashes() -> &'static HashSet<String> {
     static BAD: OnceLock<HashSet<String>> = OnceLock::new();
     BAD.get_or_init(|| {
         let mut bad = HashSet::new();
+        let fingerprint = super::known::fingerprint();
         if let Some(dir) = folder()
             && let Ok(text) = std::fs::read_to_string(dir.join("warm-bad-shaders.txt"))
         {
             for line in text.lines() {
-                if let Some(hash) = line.split_whitespace().next() {
+                let mut words = line.split_whitespace();
+                if words.next() == Some(fingerprint.as_str())
+                    && let Some(hash) = words.next()
+                {
                     let hash = hash.to_ascii_lowercase();
                     bad.insert(hash.chars().take(16).collect());
                 }
@@ -137,18 +145,6 @@ fn bad_shader_hashes() -> &'static HashSet<String> {
     })
 }
 
-/// The native name behind every shader that has faulted here so far. The
-/// hash list catches those exact containers; this catches the next variant
-/// the warm list never saw, before the title's process reaches the driver.
-fn bad_shader_family(shader: &crate::pipeline::Shader) -> bool {
-    const NAME: &[u8] = b"CS_RaytracingResolve_";
-    shader.stage == "compute"
-        && shader
-            .container
-            .windows(NAME.len())
-            .any(|part| part == NAME)
-}
-
 /// Whether any shader in this pipeline is one the warm worker found crashes
 /// this driver. Only used when `VICTORY_SKIP_WARM_BAD=1`.
 pub(crate) fn bad_shader(shaders: &[Arc<crate::pipeline::Shader>]) -> bool {
@@ -156,7 +152,7 @@ pub(crate) fn bad_shader(shaders: &[Arc<crate::pipeline::Shader>]) -> bool {
         return false;
     }
     let bad = bad_shader_hashes();
-    shaders.iter().any(|s| bad.contains(&s.hash) || bad_shader_family(s))
+    shaders.iter().any(|s| bad.contains(&s.hash))
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
