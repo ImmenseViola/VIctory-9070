@@ -106,26 +106,37 @@ pub(crate) fn kept() -> [u64; 7] {
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    // The map is hot when the title makes its tens of thousands of pipelines.
+    // Looking up a container must not hold the lock while a new `Shader` is
+    // built: that scans the container twice (`ambient`, `lightprobe`) and
+    // copies it. Two threads can build the same one; only the one inserted
+    // is kept and counted.
+    if let Some(shaders) = SHADERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        && let Some(shader) = shaders.get(&key)
+    {
+        return shader.clone();
+    }
+    let shader = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: bytes.to_vec(),
+        #[cfg(windows)]
+        ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+        #[cfg(windows)]
+        probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+        #[cfg(windows)]
+        translated: OnceLock::new(),
+    });
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| {
+    match shaders.get_or_insert_with(HashMap::new).entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
-                #[cfg(windows)]
-                probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
-        })
-        .clone()
+            entry.insert(shader).clone()
+        }
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -153,10 +164,21 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = {
+                let mut done = {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
                     translate(&self.container)
                 };
+                // `VICTORY_SHADER_OVERRIDE=<dir>`: load `<hash>.dxil` in place of
+                // this translation. A diagnostic for isolating which part of a
+                // container makes a driver refuse a PSO; off by default.
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_OVERRIDE") {
+                    let path = std::path::PathBuf::from(dir).join(format!("{}.dxil", self.hash));
+                    if let Ok(bytes) = std::fs::read(path)
+                        && let Ok(t) = &mut done
+                    {
+                        t.host.dxil = bytes;
+                    }
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

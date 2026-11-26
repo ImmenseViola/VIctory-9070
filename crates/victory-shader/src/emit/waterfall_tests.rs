@@ -129,15 +129,33 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
         // Both tables start at heap index 0.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
+            assert!(matches!(u.root, RootType::Table | RootType::ResourceHeap), "{u:?}");
             ud[u.index as usize] = 0;
+        }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        // A program that asks a heap-picked buffer for its size reads the
+        // host's table, so give it the byte lengths of the buffers bound here.
+        if let Some(n) = shader.root_srvs.iter().position(|&s| s == super::SLOT_STRIDES) {
+            use super::{SLOT_STRIDES_BYTES, VIEW_SIZES};
+            let mut table = vec![0u32; SLOT_STRIDES_BYTES as usize / 4];
+            for (slot, view) in views.iter().enumerate() {
+                if let View::Buffer { data, stride } = view {
+                    table[slot] = match stride {
+                        Stride::Raw => 1,
+                        Stride::Typed => 16,
+                        Stride::Structured(bytes) | Stride::Format(_, bytes) => *bytes,
+                    };
+                    table[VIEW_SIZES as usize / 4 + slot] = (data.len() * 4) as u32;
+                }
+            }
+            roots.push((1 + n as u32, Root::View { srv: true, data: table }));
         }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],

@@ -110,3 +110,35 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+## RDNA4, added 2026-11-26
+
+The tuned tree above was moved to an RX 9070 (RDNA4, 32 GB system RAM). The AMD
+driver faulted making the console's skinning-tree compute pipelines. The fault
+was isolated to a heap-picked buffer's `GetDimensions` in the translated DXIL,
+not to the visible ped skinning shader: that shader had only been disabled by
+an earlier crash guard. Restoring it fixed ped flicker and made NPCs render
+again.
+
+The permanent fix gives the host a third table of buffer byte lengths beside
+the view strides and addresses. A shader that can name a view slot reads its
+length there instead of asking DXIL. The byte offset is
+`VIEW_SIZES + slot * 4`; reading `VIEW_SIZES + slot` during the experiment made
+the wrong lengths visible and explains the bad early outdoor build. Texture
+dimensions and descriptors made from root arguments keep their original
+lowering. `TRANSLATOR_VERSION` moved to 3 to invalidate the wrong-offset cache.
+
+`VICTORY_SKIP_WARM_BAD=1` now refuses pipelines the warm worker found fault on,
+pipelines containing those shaders, and the `CS_RaytracingResolve_*` family, so
+a late pipeline cannot fault inside the title. It stays off on RDNA3, where the
+tuned build compiles them. XCL-style first-lane lowering, wave32 metadata,
+integer raw loads and skipped typed stores were tried but did not remove the
+fault; they remain default-off experiments. The global XCL wave64 split was not
+ported, because it can be 1.3x to 5x slower.
+
+The final 480-second validation on this card measured 18.27 FPS mean and
+19.6 FPS median over 149 world samples. The first two minutes were the stutter
+(0.1-6.9 FPS) while more than 1,600 pipelines were still being made; minutes
+3-11 held 18-21 FPS and the last two minutes were about 15 FPS. No driver or
+game fault occurred. The full investigation, rejected approaches, and
+recommended switches are in [rdna4.md](rdna4.md).

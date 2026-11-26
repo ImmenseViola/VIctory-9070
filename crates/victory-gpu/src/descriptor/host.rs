@@ -1715,8 +1715,9 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                // The strides, then the views' title addresses
-                // (`victory_shader::emit::VIEW_ADDRESSES`).
+                // The strides, the views' title addresses, then their byte
+                // lengths (`victory_shader::emit::VIEW_ADDRESSES`,
+                // `VIEW_SIZES`).
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
@@ -2760,6 +2761,7 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
             write_view_address(*data, index, view);
+            write_view_size(*data, index, view);
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -3676,6 +3678,25 @@ fn write_view_address(data: usize, index: u32, view: Option<&View>) {
         at.add(2 * index as usize).write_volatile(address as u32);
         at.add(2 * index as usize + 1).write_volatile((address >> 32) as u32);
     }
+}
+
+/// Enters the byte length of `view` (0 for none or a view that is no buffer's)
+/// at title slot `index` of the view sizes after the addresses in the mapping
+/// at `data` (`victory_shader::emit::VIEW_SIZES`): shaders that pick a buffer
+/// from the heap at a computed index read its length there instead of asking
+/// DXIL for dimensions.
+fn write_view_size(data: usize, index: u32, view: Option<&View>) {
+    use victory_shader::emit::{SLOT_STRIDES_COUNT, VIEW_SIZES};
+    if index >= SLOT_STRIDES_COUNT {
+        return;
+    }
+    let bytes = view
+        .and_then(buffer_range)
+        .map_or(0, |(_, len)| len.min(u32::MAX as u64) as u32);
+    let at = (data + VIEW_SIZES as usize) as *mut u32;
+    // SAFETY: inside the mapping (`SLOT_STRIDES_BYTES`); shaders read it
+    // while we write (each dword is one the slot had or has).
+    unsafe { at.add(index as usize).write_volatile(bytes) };
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -5278,8 +5299,34 @@ mod tests {
         assert_eq!(table[at + 14..at + 18], [0x1234_5600, 0x42, 0, 0]);
         assert_eq!(table[at + 12..at + 14], [0xdead_beef; 2], "slot 6 untouched");
         let last = at + 2 * (SLOT_STRIDES_COUNT as usize - 1);
-        assert_eq!(table[last..], [0x1234_5600, 0x42]);
+        assert_eq!(table[last..last + 2], [0x1234_5600, 0x42]);
         assert_eq!(table[..at].iter().filter(|&&w| w != 0xdead_beef).count(), 0, "the strides untouched");
+    }
+
+    /// A buffer view's byte length goes in the table after the addresses, one
+    /// dword per slot; a view that is no buffer's, and none, enter 0. The
+    /// shader reads this instead of asking DXIL for dimensions.
+    #[test]
+    fn view_sizes_follow_the_view_addresses() {
+        use victory_shader::emit::{SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_SIZES};
+        let mut table = vec![0xdead_beefu32; SLOT_STRIDES_BYTES as usize / 4];
+        let data = table.as_mut_ptr() as usize;
+        // A raw buffer view: one dword in, four dwords counted.
+        let mut desc = [0u32; 16];
+        (desc[1], desc[4], desc[6], desc[8], desc[10]) = (1, 1, 4, 1, 0x1000);
+        let view = View::Placed(false, [1, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert_eq!(buffer_range(&view), Some((0x1004, 16)));
+        write_view_size(data, 7, Some(&view));
+        write_view_size(data, 8, None);
+        write_view_size(data, SLOT_STRIDES_COUNT - 1, Some(&view));
+        // Past the table: nothing written.
+        write_view_size(data, SLOT_STRIDES_COUNT, Some(&view));
+        let at = VIEW_SIZES as usize / 4;
+        assert_eq!(table[at + 7], 16);
+        assert_eq!(table[at + 8], 0);
+        assert_eq!(table[at + SLOT_STRIDES_COUNT as usize - 1], 16);
+        assert_eq!(table[at..at + 7], [0xdead_beef; 7], "slot 6 untouched");
+        assert_eq!(table[..at].iter().filter(|&&w| w != 0xdead_beef).count(), 0, "the strides and addresses untouched");
     }
 
     /// Typed buffer views of integer formats are marked in the table of

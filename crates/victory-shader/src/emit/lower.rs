@@ -304,6 +304,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Byte lengths of buffer views read from the host's table by heap slot
+    /// ([`super::shader::VIEW_SIZES`]), by block and descriptor load.
+    sizes: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1511,6 +1514,52 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Lower a console `v_readfirstlane_b32` with a ballot of the active lanes and
+/// a lane read, as XCL does, instead of DXIL's `WaveReadLaneFirst`. XCL's form
+/// compiles a large skinning compute shader that this driver refuses with
+/// `WaveReadLaneFirst`; off by default until that is measured in a game.
+fn ballot_first_lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_BALLOT").is_some_and(|v| v == "1"))
+}
+
+/// Declare a 32-lane wave in a compute shader that uses wave intrinsics. XCL does
+/// this for every 32-thread program; VIctory normally only does it for explicit
+/// console cross-lane code, leaving some programs with wave ops but no WaveSize.
+/// Off by default until the crashing skinning shader is measured with it.
+fn force_wave32_meta() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FORCE_WAVE32_META").is_some_and(|v| v == "1"))
+}
+
+/// Drop typed UAV stores while isolating the AMD compiler's refusal of the
+/// skinning shader. Off by default; a skipped store is not a valid translation.
+fn skip_typed_store() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_TYPED_STORE").is_some_and(|v| v == "1"))
+}
+
+/// Bitmask of `GetDimensions` lowering sites to replace with `undef` while
+/// isolating the AMD compiler's refusal of the skinning shader. Bits: 2
+/// `image_get_resinfo`, 4 unorm sample coordinates, 8 cube derivative levels,
+/// 16 `image_gather4_l` texel addresses. Off by default. Buffer record counts
+/// (old bit 1) always come from the host's size table now; that replacement is
+/// the fix, not a diagnostic.
+fn skip_dims(bit: u32) -> bool {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let mask = *MASK.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_DIMS")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim();
+                let v = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+                u32::from_str_radix(v, 16).ok()
+            })
+            .unwrap_or(0)
+    });
+    mask & bit != 0
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -1948,7 +1997,7 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || one_wave && s.lds_dwords > 0 || force_wave32_meta() && wave == 32 {
                 s.wave_size = Some(wave);
             }
         }
@@ -2089,6 +2138,7 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            sizes: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -4155,6 +4205,9 @@ impl<'a> Lower<'a> {
     }
 
     fn as_int(&mut self, f: V) -> V {
+        if self.s.m.type_of(f) == self.s.t.i32 {
+            return f;
+        }
         self.s.m.cast(self.cur, Cast::Bitcast, f, self.s.t.i32)
     }
 
@@ -4661,7 +4714,7 @@ impl<'a> Lower<'a> {
         let add = self.s.m.select(e, first, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
-        let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = self.first_of_wave(e, old);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)
@@ -4676,7 +4729,7 @@ impl<'a> Lower<'a> {
             return self.s.m.bin(e, Bin::Add, base, lane);
         }
         let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
-        let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
+        let first = self.first_of_wave(e, flat);
         let wave = self.s.wave_size.unwrap_or(32);
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
@@ -5150,14 +5203,7 @@ impl<'a> Lower<'a> {
             96,
             &[],
         );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
+        let first = self.first_of_wave(e, flat);
         let wave = self.s.wave_size.expect("set with console lanes");
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
@@ -5412,7 +5458,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
-        let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        let first = self.first_of_wave(c, x);
         let Some(g) = guard else {
             return (first, self.s.m.bool(true));
         };
@@ -5444,6 +5490,22 @@ impl<'a> Lower<'a> {
             117,
             &[x, lane],
         )
+    }
+
+    /// The value of the first active lane of `x`: the console's
+    /// `v_readfirstlane_b32`. The ballot form follows XCL; the DXIL intrinsic
+    /// is kept as the default because it is smaller and already measured.
+    fn first_of_wave(&mut self, c: usize, x: V) -> V {
+        if !ballot_first_lane() {
+            return self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, self.s.t.i32, 118, &[x]);
+        }
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        let lo = self.s.m.extract(c, r, 0);
+        let lane = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        self.s.op(c, "waveReadLaneAt.i32", Attr::NoUnwind, i32t, 117, &[x, lane])
     }
 
     /// The float value of a register value.
@@ -7166,16 +7228,22 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let dim_ty = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let mip = if image.is_some() && !uav {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
         };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+        // Made only if a path actually needs a dimension: a buffer whose
+        // length came from the host's table must not leave a `GetDimensions`
+        // in the DXIL, which this driver refuses to compile.
+        let mut dims = None;
+        let mut field = |l: &mut Self, k: u32| -> V {
+            let d = *dims.get_or_insert_with(|| {
+                l.s.op(c, "getDimensions", Attr::ReadOnly, dim_ty, 72, &[h, mip])
+            });
+            l.s.m.extract(c, d, k)
+        };
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
                 let one = self.s.m.i32(1);
@@ -7215,7 +7283,15 @@ impl<'a> Lower<'a> {
             }
             None => {
                 // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
+                // The host knows the view's byte length in `VIEW_SIZES`, so a
+                // program that picks the view from the heap need not ask DXIL
+                // for dimensions (this driver faults on that query in one
+                // console skinning shader). Without a host slot, the query is
+                // still the only source of the length.
+                let n = match self.slot_size(&src)? {
+                    Some(size) => size,
+                    None => field(self, 0),
+                };
                 let stride = used.map_or(0, |u| u.stride);
                 let counted = inst
                     .write(Reg::S(code + first + 2))
@@ -7357,8 +7433,7 @@ impl<'a> Lower<'a> {
             });
             if per_lane {
                 self.s.flags |= flags::WAVE_OPS;
-                let i32t = self.s.t.i32;
-                let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                let first = self.first_of_wave(c, d);
                 d = if self.s.pixel && super::helper_own() {
                     let helper = self.helper_lane();
                     self.s.m.select(c, helper, d, first)
@@ -8198,6 +8273,58 @@ impl<'a> Lower<'a> {
             self.s.m.cmp(c, pred::NE, x, zero)
         });
         Ok(Some((int, signed)))
+    }
+
+    /// The byte length of the buffer view `src` names, from the host's table
+    /// ([`super::shader::VIEW_SIZES`]), when the descriptor is a table entry
+    /// or one picked from the view heap (`RootType::Table` or
+    /// `RootType::ResourceHeap`).
+    fn slot_size(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        // Both a table entry and a descriptor picked from the view heap name
+        // a slot of the host's view tables: `heap_index` finds the slot in
+        // either case. Only a descriptor built from root arguments has no slot.
+        let in_heaps = self.scalar.get(load).is_some_and(|a| {
+            self.x
+                .native
+                .layout
+                .get(a.param)
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap))
+        });
+        if !in_heaps {
+            return Ok(None);
+        }
+        let key = (self.cur, *load, *first);
+        if let Some(&v) = self.sizes.get(&key) {
+            return Ok(Some(v));
+        }
+        let c = self.cur;
+        let slot = self.heap_index(*load, *first, false)?;
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, self.s.t.i32, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let sizes = self.s.m.i32(super::shader::VIEW_SIZES);
+        let two = self.s.m.i32(2);
+        let offset = self.s.m.bin(c, Bin::Shl, slot, two);
+        let byte = self.s.m.bin(c, Bin::Add, offset, sizes);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        let v = self.as_int(f);
+        self.sizes.insert(key, v);
+        Ok(Some(v))
     }
 
     /// The host's word for the buffer view `src` names: its stride and
@@ -11680,9 +11807,11 @@ impl<'a> Lower<'a> {
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-            let d = self
-                .s
-                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let d = if skip_dims(2) {
+                self.s.m.undef(dims)
+            } else {
+                self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip])
+            };
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
@@ -11789,9 +11918,11 @@ impl<'a> Lower<'a> {
                 let i32t = self.s.t.i32;
                 let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                 let z = self.s.m.i32(0);
-                let d = self
-                    .s
-                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                let d = if skip_dims(4) {
+                    self.s.m.undef(dims)
+                } else {
+                    self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z])
+                };
                 for (k, slot) in cs.iter_mut().enumerate().take(spatial) {
                     let n = self.s.m.extract(c, d, k as u32);
                     let n = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
@@ -11986,9 +12117,11 @@ impl<'a> Lower<'a> {
                     let i32t = self.s.t.i32;
                     let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                     let z = self.s.m.i32(0);
-                    let d = self
-                        .s
-                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                    let d = if skip_dims(8) {
+                        self.s.m.undef(dims)
+                    } else {
+                        self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z])
+                    };
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
@@ -12077,9 +12210,11 @@ impl<'a> Lower<'a> {
                         let lod = self.unary(26, lod); // round to nearest
                         let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
                         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-                        let d = self
-                            .s
-                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        let d = if skip_dims(16) {
+                            self.s.m.undef(dims)
+                        } else {
+                            self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip])
+                        };
                         let half = self.s.m.f32(0.5f32.to_bits());
                         let one = self.s.m.f32(1.0f32.to_bits());
                         let (mut lo, mut hi) = ([iu; 2], [iu; 2]);
@@ -12607,6 +12742,9 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
+                if skip_typed_store() {
+                    return Ok(());
+                }
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
                 if count != 4 || *offen || *offset != 0 {

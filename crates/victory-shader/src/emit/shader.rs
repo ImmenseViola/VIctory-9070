@@ -41,8 +41,14 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// Read by a program that takes the address out of a descriptor it picks
 /// at a computed index and walks the memory behind it.
 pub const VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Where the [`SLOT_STRIDES`] buffer's third table begins (bytes): one dword
+/// per view heap slot, the byte length of the buffer view there; 0 for
+/// anything else. Read instead of DXIL's `GetDimensions` when a program asks
+/// a buffer descriptor for its record count: the host knows the view's size,
+/// and this driver faults compiling that query on some console shaders.
+pub const VIEW_SIZES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
 /// Bytes of the whole [`SLOT_STRIDES`] buffer.
-pub const SLOT_STRIDES_BYTES: u32 = VIEW_ADDRESSES + SLOT_STRIDES_COUNT * 8;
+pub const SLOT_STRIDES_BYTES: u32 = VIEW_SIZES + SLOT_STRIDES_COUNT * 4;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -132,6 +138,7 @@ pub(crate) struct Types {
     pub bind: Ty,
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
+    pub res_ret_i32: Ty,
 }
 
 /// What a mesh shader declares beyond its thread-group size.
@@ -223,6 +230,14 @@ pub fn raw_views() -> u32 {
     RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Emit raw buffer loads as integers, as XCL's HLSL does, instead of loading
+/// floats and bitcasting them. A diagnostic for the AMD compiler's refusal of
+/// the skinning shader; off by default.
+pub fn raw_load_i32() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_LOAD_I32").is_some_and(|v| v == "1"))
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -275,6 +290,7 @@ impl Shader {
         let bind = m.named_struct("dx.types.ResBind", vec![i32, i32, i32, i8]);
         let cbuf_ret = m.named_struct("dx.types.CBufRet.i32", vec![i32, i32, i32, i32]);
         let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32, f32, f32, f32, i32]);
+        let res_ret_i32 = m.named_struct("dx.types.ResRet.i32", vec![i32, i32, i32, i32, i32]);
         let main_ty = m.func_ty(void, vec![]);
         m.ptr(main_ty);
         let main = m.function("main", main_ty, None, true);
@@ -291,6 +307,7 @@ impl Shader {
                 bind,
                 cbuf_ret,
                 res_ret,
+                res_ret_i32,
             },
             pixel,
             inputs: Vec::new(),
@@ -337,6 +354,11 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        let (name, ret) = if raw_load_i32() && name == "rawBufferLoad.f32" {
+            ("rawBufferLoad.i32", self.t.res_ret_i32)
+        } else {
+            (name, ret)
+        };
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);

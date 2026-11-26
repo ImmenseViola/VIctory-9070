@@ -15,6 +15,11 @@ use crate::{ShaderError, io, ir, resource, structure};
 /// s0 and the view heap at s1; `srv`: the dwords and the stride of the used
 /// resource at the table's first entry (the third is a raw UAV).
 fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
+    build_with(RootType::Table, words, srv)
+}
+
+/// As [`build`], with the buffer's descriptor picked from the view heap.
+fn build_with(buffer_root: RootType, words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
     let param = |root, user_data| RootParam {
         root,
         table_offset_dwords: 0,
@@ -23,9 +28,9 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         user_data,
         slot: 0,
     };
-    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+    let range = |kind, root, table_offset_dwords, dwords, stride| UsedResource {
         kind,
-        root: RootType::Table,
+        root,
         table_offset_dwords,
         lower_bound: 0,
         stride,
@@ -33,14 +38,16 @@ fn build(words: &[u32], srv: (u8, u32)) -> Result<HostShader, ShaderError> {
         user_data: 0,
         slot: 0,
     };
+    // `FROM_HEAP` reads heap slot 1: eight dwords into the heap.
+    let buffer_offset = if buffer_root == RootType::ResourceHeap { 8 } else { 0 };
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
         layout: vec![param(RootType::Table, 0), param(RootType::ResourceHeap, 1)],
         used: vec![
-            range(ResourceType::Srv, 0, srv.0, srv.1),
-            range(ResourceType::Uav, 16, 4, 0),
+            range(ResourceType::Srv, buffer_root, buffer_offset, srv.0, srv.1),
+            range(ResourceType::Uav, RootType::Table, 16, 4, 0),
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
@@ -138,6 +145,16 @@ const COUNT: &[u32] = &[
     0xBE85_0380, // s_mov_b32 s5, 0
 ];
 
+/// The count of a heap descriptor already in s[8:11] (dword 2 in s10), with
+/// one value read through it (as a structured buffer's element).
+const PICKED_COUNT: &[u32] = &[
+    0x7E06_0280, // v_mov_b32 v3, 0
+    0xE030_2000, // buffer_load_dword v5, v3, s[8:11], 0 idxen
+    0x8002_0503,
+    0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+    0xBE84_030A, // s_mov_b32 s4, s10
+];
+
 /// A puddle pass of the title picks three textures from the view heap,
 /// reads the first one's size and samples the other two.
 #[test]
@@ -196,6 +213,33 @@ fn the_record_count_of_a_structured_buffer_nothing_reads() {
     // A stride of 4 or less may be a typed view's component count.
     assert!(build(&words, (4, 4)).is_err());
     assert!(build(&words, (4, 0)).is_err());
+}
+
+/// A heap-picked buffer's byte length comes from the host's table, not from
+/// DXIL's `GetDimensions`: that query makes the RDNA4 driver refuse the
+/// skinning shaders that ask for it. The host knows the same bytes the raw
+/// view's dimensions would hold, and divides by the host's element stride.
+#[test]
+fn the_byte_length_of_a_picked_buffer_comes_from_the_hosts_table() {
+    let words = [TABLE, FROM_HEAP, PICKED_COUNT, STORE].concat();
+    let shader = build_with(RootType::ResourceHeap, &words, (4, 16)).expect("translates");
+    assert!(shader.root_srvs.contains(&super::SLOT_STRIDES), "{:?}", shader.root_srvs);
+    assert!(
+        !shader.dxil.windows(b"getDimensions".len()).any(|w| w == b"getDimensions"),
+        "no buffer GetDimensions is left in the DXIL"
+    );
+    let (data, texel) = ([0u32; 12], [[0.0; 4]; 1]);
+    let views = [
+        View::Texture(1, 1, &texel),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(2),
+    ];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [48, 0], "{label}");
+    }
 }
 
 /// As [`the_record_count_of_a_structured_buffer_nothing_reads`], of one the

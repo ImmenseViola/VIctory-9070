@@ -8,12 +8,15 @@
 //! buffer, behind the title's picture: saved frames and the frame recorder
 //! see the title's own.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -205,12 +208,61 @@ impl Counters {
     }
 }
 
+thread_local! {
+    static CPU: RefCell<CpuSample> = RefCell::new(CpuSample::default());
+}
+
+#[derive(Default)]
+struct CpuSample {
+    system: Option<(u64, u64, u64)>,
+    process: Option<(u64, Instant)>,
+}
+
+fn ticks(f: &FILETIME) -> u64 {
+    ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
+}
+
+/// System CPU use and VIctory's own CPU use, both as a percentage of one core.
+fn cpu_percent() -> (f64, f64) {
+    CPU.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let mut idle = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+
+        let mut pcreate = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut pexit = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut pkernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut puser = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        unsafe { GetProcessTimes(GetCurrentProcess(), &mut pcreate, &mut pexit, &mut pkernel, &mut puser) };
+
+        let now = (ticks(&idle), ticks(&kernel), ticks(&user));
+        let pnow = (ticks(&pkernel) + ticks(&puser), Instant::now());
+        let out = match (s.system, s.process) {
+            (Some((pi, pk, pu)), Some((pp, at))) => {
+                let total = (now.1 + now.2).saturating_sub(pk + pu);
+                let busy = total.saturating_sub(now.0.saturating_sub(pi));
+                let sys = if total > 0 { (busy as f64 / total as f64 * 100.0).min(100.0) } else { 0.0 };
+                let elapsed = pnow.1.duration_since(at).as_secs_f64();
+                let vic = if elapsed > 0.0 { pnow.0.saturating_sub(pp) as f64 / 1e7 / elapsed * 100.0 } else { 0.0 };
+                (sys, vic)
+            }
+            _ => (0.0, 0.0),
+        };
+        s.system = Some(now);
+        s.process = Some(pnow);
+        out
+    })
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     let (working, private) = crate::copystat::process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
+    let (sys_cpu, vic_cpu) = cpu_percent();
     let idle = (c[1] / 1e3).min(ms);
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
@@ -221,7 +273,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
+        format!("CPU SYS {sys_cpu:.1}% VIC {vic_cpu:.1}% PANEL {cost:.0}US"),
     ]
 }
 

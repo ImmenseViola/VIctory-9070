@@ -418,6 +418,12 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        if super::library::bad_shader(shaders) {
+            return refuse(
+                "a shader in this pipeline crashes this driver (VICTORY_SKIP_WARM_BAD=1)",
+                shaders,
+            );
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

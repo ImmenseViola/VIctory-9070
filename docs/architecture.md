@@ -97,3 +97,11 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+The host writes three parallel tables for the title's bindless views into one
+root SRV (`SLOT_STRIDES`, `t255 space1`): stride and format kind, title address,
+and byte length. Translated shaders read strides and addresses from the table
+for a descriptor they pick at a computed index. Where a buffer descriptor is
+named by a table entry or the view heap, its byte length also comes from the
+table instead of DXIL's `getDimensions`; this avoids an AMD compiler fault on
+RDNA4. See [rdna4.md](rdna4.md).

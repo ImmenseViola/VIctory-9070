@@ -46,11 +46,22 @@
 //! with a 64 MB file written past the system's cache, mapped and replaced:
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
+//!
+//! A pipeline `victory warm` found crashes this driver is named in
+//! `warm-bad.txt`. Running games do not read that file, so they compile it
+//! again inside the title and the driver faults there. `VICTORY_SKIP_WARM_BAD=1`
+//! makes runs refuse those pipelines instead: the title goes without them.
+//! `warm-bad-shaders.txt` names the shaders behind those pipelines too, so a
+//! late pipeline with one of the same shaders is refused before the driver
+//! sees it; the whole `CS_RaytracingResolve_*` compute family is refused as
+//! well, for variants the warm list has not seen. This is meant for a card
+//! whose driver cannot compile them (a RDNA4 card with the title's FSR4
+//! passes, for example); nothing is skipped by default.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -65,6 +76,87 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 /// The folder the library is kept in.
 pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
+}
+
+/// Whether runs should refuse the pipelines the warm worker found crash the
+/// driver (`VICTORY_SKIP_WARM_BAD=1`). Off by default: the tuned RDNA3 build
+/// compiles all of them, and only a card whose driver faults needs this.
+fn skip_warm_bad() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_WARM_BAD").is_some_and(|v| v == "1"))
+}
+
+/// The keys `victory warm` wrote to `warm-bad.txt`.
+fn bad_keys() -> &'static HashSet<String> {
+    static BAD: OnceLock<HashSet<String>> = OnceLock::new();
+    BAD.get_or_init(|| {
+        let mut bad = HashSet::new();
+        if let Some(dir) = folder()
+            && let Ok(text) = std::fs::read_to_string(dir.join("warm-bad.txt"))
+        {
+            for line in text.lines() {
+                if let Some(key) = line.split_whitespace().next() {
+                    bad.insert(key.to_owned());
+                }
+            }
+        }
+        bad
+    })
+}
+
+/// Whether this pipeline is one `victory warm` could not make on this
+/// driver. Warm names title pipelines; [`pipeline`] is handed a host library
+/// name, so both are checked.
+pub(crate) fn is_bad(name: &str) -> bool {
+    if !skip_warm_bad() {
+        return false;
+    }
+    let bad = bad_keys();
+    bad.contains(name) || TITLE_KEY.with(|k| bad.contains(k.borrow().as_str()))
+}
+
+/// The shader hashes named in `warm-bad-shaders.txt`, shortened to the first
+/// eight bytes as [`crate::pipeline::Shader::hash`] reports them. A pipeline
+/// the warm list never saw can still fault on one of these shaders late in a
+/// run; checking the shader keeps that from happening in the title's process.
+fn bad_shader_hashes() -> &'static HashSet<String> {
+    static BAD: OnceLock<HashSet<String>> = OnceLock::new();
+    BAD.get_or_init(|| {
+        let mut bad = HashSet::new();
+        if let Some(dir) = folder()
+            && let Ok(text) = std::fs::read_to_string(dir.join("warm-bad-shaders.txt"))
+        {
+            for line in text.lines() {
+                if let Some(hash) = line.split_whitespace().next() {
+                    let hash = hash.to_ascii_lowercase();
+                    bad.insert(hash.chars().take(16).collect());
+                }
+            }
+        }
+        bad
+    })
+}
+
+/// The native name behind every shader that has faulted here so far. The
+/// hash list catches those exact containers; this catches the next variant
+/// the warm list never saw, before the title's process reaches the driver.
+fn bad_shader_family(shader: &crate::pipeline::Shader) -> bool {
+    const NAME: &[u8] = b"CS_RaytracingResolve_";
+    shader.stage == "compute"
+        && shader
+            .container
+            .windows(NAME.len())
+            .any(|part| part == NAME)
+}
+
+/// Whether any shader in this pipeline is one the warm worker found crashes
+/// this driver. Only used when `VICTORY_SKIP_WARM_BAD=1`.
+pub(crate) fn bad_shader(shaders: &[Arc<crate::pipeline::Shader>]) -> bool {
+    if !skip_warm_bad() {
+        return false;
+    }
+    let bad = bad_shader_hashes();
+    shaders.iter().any(|s| bad.contains(&s.hash) || bad_shader_family(s))
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -255,11 +347,24 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The title pipeline this thread is making, the key warm records.
+    static TITLE_KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Names the pipeline this thread makes next.
 pub(crate) fn label(text: String) {
     LABEL.with(|l| *l.borrow_mut() = text);
+}
+
+/// Names the title pipeline this thread makes next, so its warm-bad key can
+/// be refused before the driver sees its shaders.
+pub(crate) fn set_title_key(key: &str) {
+    TITLE_KEY.with(|k| *k.borrow_mut() = key.to_owned());
+}
+
+/// Forgets the title pipeline this thread was making.
+pub(crate) fn clear_title_key() {
+    TITLE_KEY.with(|k| k.borrow_mut().clear());
 }
 
 /// A library call of this thread, listed in [`CALLS`] until dropped.
@@ -520,6 +625,21 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    if is_bad(name) {
+        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let mut warned = WARNED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if warned.insert(name.to_owned()) {
+            tracing::warn!(
+                name,
+                shaders = %LABEL.with(|l| l.borrow().clone()),
+                "refusing a pipeline the warm worker found crashes this driver (VICTORY_SKIP_WARM_BAD=1)"
+            );
+        }
+        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+    }
     let create = || {
         let _creating = crate::timeline::span("pipeline: create a PSO in the driver");
         create()
